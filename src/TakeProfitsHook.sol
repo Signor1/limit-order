@@ -46,6 +46,9 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
     mapping(uint256 positionId => uint256 claimsSupply)
         public claimTokensSupply;
 
+    mapping(uint256 positionId => uint256 outputClaimable)
+        public claimableOutputTokens;
+
     // Constructor
     constructor(
         IPoolManager _manager,
@@ -150,6 +153,93 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         Currency token = zeroForOne ? key.currency0 : key.currency1;
         token.transfer(msg.sender, amountToCancel);
     }
+
+    function redeem(
+        PoolKey calldata key,
+        int24 tickToSellAt,
+        bool zeroForOne,
+        uint256 inputAmountToClaimFor
+    ) external {
+        // Get lower actually usable tick for their order
+        int24 tick = getLowerUsableTick(tickToSellAt, key.tickSpacing);
+        uint256 positionId = getPositionId(key, tick, zeroForOne);
+
+        // If no output tokens can be claimed yet i.e. order hasn't been filled
+        // throw error
+        if (claimableOutputTokens[positionId] == 0) revert NothingToClaim();
+
+        // they must have claim tokens >= inputAmountToClaimFor
+        uint256 positionTokens = balanceOf(msg.sender, positionId);
+        if (positionTokens < inputAmountToClaimFor) revert NotEnoughToClaim();
+
+        uint256 totalClaimableForPosition = claimableOutputTokens[positionId];
+        uint256 totalInputAmountForPosition = claimTokensSupply[positionId];
+
+        // outputAmount = (inputAmountToClaimFor * totalClaimableForPosition) / (totalInputAmountForPosition)
+        uint256 outputAmount = inputAmountToClaimFor.mulDivDown(
+            totalClaimableForPosition,
+            totalInputAmountForPosition
+        );
+
+        // Reduce claimable output tokens amount
+        // Reduce claim token total supply for position
+        // Burn claim tokens
+        claimableOutputTokens[positionId] -= outputAmount;
+        claimTokensSupply[positionId] -= inputAmountToClaimFor;
+        _burn(msg.sender, positionId, inputAmountToClaimFor);
+
+        // Transfer output tokens
+        Currency token = zeroForOne ? key.currency1 : key.currency0;
+        token.transfer(msg.sender, outputAmount);
+    }
+
+    function swapAndSettleBalances(
+        PoolKey calldata key,
+        IPoolManager.SwapParams memory params
+    ) internal returns (BalanceDelta) {
+        // Conduct the swap inside the Pool Manager
+        BalanceDelta delta = poolManager.swap(key, params, "");
+
+        // If we just did a zeroForOne swap
+        // We need to send Token 0 to PM, and receive Token 1 from PM
+        if (params.zeroForOne) {
+            // Negative Value => Money leaving user's wallet
+            // Settle with PoolManager
+            if (delta.amount0() < 0) {
+                _settle(key.currency0, uint128(-delta.amount0()));
+            }
+
+            // Positive Value => Money coming into user's wallet
+            // Take from PM
+            if (delta.amount1() > 0) {
+                _take(key.currency1, uint128(delta.amount1()));
+            }
+        } else {
+            if (delta.amount1() < 0) {
+                _settle(key.currency1, uint128(-delta.amount1()));
+            }
+
+            if (delta.amount0() > 0) {
+                _take(key.currency0, uint128(delta.amount0()));
+            }
+        }
+
+        return delta;
+    }
+
+    function _settle(Currency currency, uint128 amount) internal {
+        // Transfer tokens to PM and let it know
+        poolManager.sync(currency);
+        currency.transfer(address(poolManager), amount);
+        poolManager.settle();
+    }
+
+    function _take(Currency currency, uint128 amount) internal {
+        // Take tokens out of PM to our hook contract
+        poolManager.take(currency, address(this), amount);
+    }
+
+    // #################### Helper Functions #################################
 
     function getLowerUsableTick(
         int24 tick,
